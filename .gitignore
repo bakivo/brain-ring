@@ -1,0 +1,11 @@
+# build directory name
+build
+
+# Eclipse Settings
+.cproject
+.project
+
+# project backups
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults
