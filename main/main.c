@@ -13,11 +13,14 @@
 #include "nvs_flash.h"
 #include "mdns.h"
 #include "lwip/apps/netbiosns.h"
+#include "esp_http_server.h"
 
 #define MDNS_INSTANCE "esp home web server"
 
 static const char *TAG = "mesh_main";
 static const char *TEST_TAG = "mesh_numbers_producer";
+static const char *REST_TAG = "esp-rest";
+
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
 static bool is_mesh_connected = false;
 static bool is_test_data = true;
@@ -31,6 +34,7 @@ struct AMessage
 char ucMessageID;
 char ucData[ 20 ];
 } xMessage;
+httpd_handle_t start_webserver(void);
 
 static void numbers_producer(){
 	ESP_LOGI(TEST_TAG, "task started");
@@ -105,6 +109,8 @@ void ip_event_handler(	void *event_handler_arg,
 	if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
 		ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
 		ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+
+		start_webserver();
 	}
 }
 void mesh_event_handler(void *arg, esp_event_base_t event_base,
@@ -308,6 +314,41 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
 void mesh_init(){
 
 }
+
+esp_err_t get_handler(httpd_req_t *req) {
+	const char resp[] = "Sweet as";
+	httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+	return ESP_OK;
+}
+
+httpd_uri_t uri_get = {
+	.uri = "/data",
+	.method = HTTP_GET,
+	.handler = get_handler,
+	.user_ctx = NULL
+};
+
+//Function for starting the webserver
+httpd_handle_t start_webserver(void)
+{
+    ESP_LOGI(REST_TAG, "Starting HTTP Server");
+    //Generate default configuration
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    //Empty handle to esp_http_server
+    httpd_handle_t server = NULL;
+
+
+    /* Start the httpd server */
+    if (httpd_start(&server, &config) == ESP_OK) {
+        /* Register URI handlers */
+        httpd_register_uri_handler(server, &uri_get);
+        //httpd_register_uri_handler(server, &uri_post);
+    }
+    /* If server failed to start, handle will be NULL */
+    return server;
+}
+
 void app_main(void)
 {
 	//Allow the second core to finish initialization
