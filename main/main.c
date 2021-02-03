@@ -11,6 +11,10 @@
 #include "esp_mesh.h"
 #include "esp_mesh_internal.h"
 #include "nvs_flash.h"
+#include "mdns.h"
+#include "lwip/apps/netbiosns.h"
+
+#define MDNS_INSTANCE "esp home web server"
 
 static const char *TAG = "mesh_main";
 static const char *TEST_TAG = "mesh_numbers_producer";
@@ -39,6 +43,21 @@ static void numbers_producer(){
 		counter++;
         vTaskDelay(pdMS_TO_TICKS(1000));
 	}
+}
+
+static void initialise_mdns(void)
+{
+    mdns_init();
+    mdns_hostname_set("esp-home");
+    mdns_instance_name_set(MDNS_INSTANCE);
+
+    mdns_txt_item_t serviceTxtData[] = {
+        {"board", "esp32"},
+        {"path", "/"}
+    };
+
+    ESP_ERROR_CHECK(mdns_service_add("ESP32-WebServer", "_http", "_tcp", 80, serviceTxtData,
+                                     sizeof(serviceTxtData) / sizeof(serviceTxtData[0])));
 }
 
 static void esp_mesh_p2p_tx_main(void *arg) {
@@ -308,6 +327,11 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_netif_init());
 	//Event Loop initialization
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	//mDNS initialization
+	initialise_mdns();
+	netbiosns_init();
+	netbiosns_set_name("esp-home");
+
 	//Create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored */
 	ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
 	//WiFi initialization
