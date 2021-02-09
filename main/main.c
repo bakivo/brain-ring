@@ -14,38 +14,38 @@
 #include "mdns.h"
 #include "lwip/apps/netbiosns.h"
 #include "esp_http_server.h"
+#include "cJSON.h"
+#include "esp_vfs.h"
 
 #define MDNS_INSTANCE "esp home web server"
+#define SCRATCH_BUFSIZE (1024)
 
 static const char *TAG = "mesh_main";
 static const char *TEST_TAG = "mesh_numbers_producer";
 static const char *REST_TAG = "esp-rest";
 
+static bool should_generate = true;
+
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
 static bool is_mesh_connected = false;
-static bool is_test_data = true;
 static int mesh_layer = -1;
 static mesh_addr_t mesh_parent_addr;
 static esp_netif_t *netif_sta = NULL;
+
 static QueueHandle_t numbers;
 
-struct AMessage
-{
-char ucMessageID;
-char ucData[ 20 ];
-} xMessage;
 httpd_handle_t start_webserver(void);
 
 static void numbers_producer(){
 	ESP_LOGI(TEST_TAG, "task started");
 	uint8_t counter = 0;
-	uint8_t *p1 = &counter;
 	while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        if(!should_generate) continue;
 		if (counter == 100) counter = 0;
-		xQueueSend(numbers, &p1, portMAX_DELAY);
 		ESP_LOGI(TEST_TAG, "value %d sent", counter);
+		xQueueSend(numbers, &counter, portMAX_DELAY);
 		counter++;
-        vTaskDelay(pdMS_TO_TICKS(1000));
 	}
 }
 
@@ -65,56 +65,41 @@ static void initialise_mdns(void)
 }
 
 static void esp_mesh_p2p_tx_main(void *arg) {
-	uint8_t value_tx = 0;
-	uint8_t *p1;
+	uint8_t val = 0;
     esp_err_t err;
     mesh_addr_t route_table[10];
-    //uint8_t multi_addr[6] = {"01","00","5E","xx","xx","xx"};
-
     mesh_data_t data;
-    //data.data = &p1;
     data.size = sizeof(uint8_t);
     data.proto = MESH_PROTO_BIN;
     data.tos = MESH_TOS_P2P;
 
-    int route_table_size = 0;
-    int route_table_size_alt = 0;
+    int size = 0;
 	while (1) {
-		xQueueReceive(numbers, &p1, portMAX_DELAY);
-		ESP_LOGI(TAG,"value to send to peers: %d", *p1);
-		data.data = p1;
-		route_table_size = esp_mesh_get_routing_table_size();
-		ESP_LOGI(TAG,"esp_mesh_get_routing_table_size() returned %d ", route_table_size);
-		esp_mesh_get_routing_table(route_table, 60, &route_table_size_alt);
-        for (int i = 0; i < route_table_size_alt; i++) {
+		xQueueReceive(numbers, &val, portMAX_DELAY);
+		ESP_LOGI(TAG,"value to send to peers: %d", val);
+		data.data = &val;
+		esp_mesh_get_routing_table(route_table, 60, &size);
+        for (int i = 0; i < size; i++) {
         	err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
-        	if(err != ESP_OK){
-				ESP_LOGI(TAG, "esp_mesh_send returned with error code %d", err);
-        	}
+        	if(err != ESP_OK) ESP_LOGI(TAG, "esp_mesh_send returned with error code %d", err);
         }
 	}
 }
 
 void esp_mesh_comm_p2p_start(){
-	if(is_test_data){
-		xTaskCreate(numbers_producer, "PRODUCER1", 3072, NULL, 5, NULL);
-	}
     xTaskCreate(esp_mesh_p2p_tx_main, "MPTX", 3072, NULL, 5, NULL);
-
 }
 
-void ip_event_handler(	void *event_handler_arg,
-						esp_event_base_t event_base, int32_t event_id, void *event_data)
+void ip_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
 	if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
 		ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
 		ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-
 		start_webserver();
 	}
 }
-void mesh_event_handler(void *arg, esp_event_base_t event_base,
-                        int32_t event_id, void *event_data)
+
+void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     mesh_addr_t id = {0,};
     static uint16_t last_layer = 0;
@@ -136,7 +121,6 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
     case MESH_EVENT_CHILD_CONNECTED: {
         mesh_event_child_connected_t *child_connected = (mesh_event_child_connected_t *)event_data;
         ESP_LOGI(TAG, "<MESH_EVENT_CHILD_CONNECTED>aid:%d, "MACSTR"", child_connected->aid, MAC2STR(child_connected->mac));
-        esp_mesh_comm_p2p_start();
     }
     break;
     case MESH_EVENT_CHILD_DISCONNECTED: {
@@ -178,11 +162,9 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
                  esp_mesh_is_root() ? "<ROOT>" :
                  (mesh_layer == 2) ? "<layer2>" : "", MAC2STR(id.addr), connected->duty);
         last_layer = mesh_layer;
-        //mesh_connected_indicator(mesh_layer);
         is_mesh_connected = true;
-        if (esp_mesh_is_root()) {
-            esp_netif_dhcpc_start(netif_sta);
-        }
+        esp_netif_dhcpc_start(netif_sta);
+        esp_mesh_comm_p2p_start();
     }
     break;
     case MESH_EVENT_PARENT_DISCONNECTED: {
@@ -310,23 +292,44 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-
 void mesh_init(){
 
 }
 
-esp_err_t get_handler(httpd_req_t *req) {
-	const char resp[] = "Sweet as";
-	httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+static esp_err_t get_handler(httpd_req_t *req) {
+    ESP_LOGI(REST_TAG, "req_length = %d, uri = %s", req->content_len, req->uri);
+
+	httpd_resp_sendstr(req, "Sweet as bro");
 	return ESP_OK;
 }
 
-httpd_uri_t uri_get = {
-	.uri = "/data",
-	.method = HTTP_GET,
-	.handler = get_handler,
-	.user_ctx = NULL
-};
+/* Simple handler for light brightness control */
+static esp_err_t post_handler(httpd_req_t *req)
+{
+    char content[100];
+    size_t recv_size = req->content_len;
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) {  /* 0 return value indicates connection closed */
+		/* Check if timeout occurred */
+		if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+			/* In case of timeout one can choose to retry calling
+			 * httpd_req_recv(), but to keep it simple, here we
+			 * respond with an HTTP 408 (Request Timeout) error */
+			httpd_resp_send_408(req);
+		}
+		return ESP_FAIL;
+	}
+    content[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(content);
+    int red = cJSON_GetObjectItem(root, "red")->valueint;
+    int green = cJSON_GetObjectItem(root, "green")->valueint;
+    int blue = cJSON_GetObjectItem(root, "blue")->valueint;
+    ESP_LOGI(REST_TAG, "Light control: red = %d, green = %d, blue = %d", red, green, blue);
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "Post control value successfully");
+    return ESP_OK;
+}
 
 //Function for starting the webserver
 httpd_handle_t start_webserver(void)
@@ -341,9 +344,23 @@ httpd_handle_t start_webserver(void)
 
     /* Start the httpd server */
     if (httpd_start(&server, &config) == ESP_OK) {
+
+    	httpd_uri_t uri_get = {
+    		.uri = "/data",
+    		.method = HTTP_GET,
+    		.handler = get_handler,
+    		.user_ctx = NULL
+    	};
+
+    	httpd_uri_t uri_post = {
+    		.uri = "/hue",
+    		.method = HTTP_POST,
+    		.handler = post_handler,
+    		.user_ctx = NULL
+    	};
         /* Register URI handlers */
         httpd_register_uri_handler(server, &uri_get);
-        //httpd_register_uri_handler(server, &uri_post);
+        httpd_register_uri_handler(server, &uri_post);
     }
     /* If server failed to start, handle will be NULL */
     return server;
@@ -361,8 +378,9 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK(ret);
 
-	//Queue memory allocation
-	numbers = xQueueCreate(5, sizeof(uint8_t *));
+	//Queue memory allocation for number producer task
+	numbers = xQueueCreate(10, sizeof(uint8_t));
+	xTaskCreate(numbers_producer, "PRODUCER1", 3072, NULL, 5, NULL);
 
     //TCP/IP initialization
 	ESP_ERROR_CHECK(esp_netif_init());
