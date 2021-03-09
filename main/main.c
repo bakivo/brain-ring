@@ -16,25 +16,32 @@
 #include "esp_http_server.h"
 #include "cJSON.h"
 #include "esp_vfs.h"
+#include "driver/rmt.h"
+#include "led_strip.h"
 
 #define MDNS_INSTANCE "esp home web server"
 #define SCRATCH_BUFSIZE (1024)
-
+#define RMT_TX_GPIO (18)
+#define N_PIXELS (5)
+#define REF_TASK_PRIORITY (3)
+#define CHASE_SPEED_MS (2000)
 static const char *TAG = "mesh_main";
 static const char *TEST_TAG = "mesh_numbers_producer";
 static const char *REST_TAG = "esp-rest";
-
 static bool should_generate = true;
-
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
 static bool is_mesh_connected = false;
 static int mesh_layer = -1;
 static mesh_addr_t mesh_parent_addr;
 static esp_netif_t *netif_sta = NULL;
 
+static SemaphoreHandle_t sync_led_task;
+
 static QueueHandle_t numbers;
 
 httpd_handle_t start_webserver(void);
+
+
 
 static void numbers_producer(){
 	ESP_LOGI(TEST_TAG, "task started");
@@ -366,6 +373,110 @@ httpd_handle_t start_webserver(void)
     return server;
 }
 
+void led_strip_hsv2rgb(uint32_t h, uint32_t s, uint32_t v, uint32_t *r, uint32_t *g, uint32_t *b)
+{
+    h %= 360; // h -> [0,360]
+    uint32_t rgb_max = v * 2.55f;
+    uint32_t rgb_min = rgb_max * (100 - s) / 100.0f;
+
+    uint32_t i = h / 60;
+    uint32_t diff = h % 60;
+
+    // RGB adjustment amount by hue
+    uint32_t rgb_adj = (rgb_max - rgb_min) * diff / 60;
+
+    switch (i) {
+    case 0:
+        *r = rgb_max;
+        *g = rgb_min + rgb_adj;
+        *b = rgb_min;
+        break;
+    case 1:
+        *r = rgb_max - rgb_adj;
+        *g = rgb_max;
+        *b = rgb_min;
+        break;
+    case 2:
+        *r = rgb_min;
+        *g = rgb_max;
+        *b = rgb_min + rgb_adj;
+        break;
+    case 3:
+        *r = rgb_min;
+        *g = rgb_max - rgb_adj;
+        *b = rgb_max;
+        break;
+    case 4:
+        *r = rgb_min + rgb_adj;
+        *g = rgb_min;
+        *b = rgb_max;
+        break;
+    default:
+        *r = rgb_max;
+        *g = rgb_min;
+        *b = rgb_max - rgb_adj;
+        break;
+    }
+}
+
+/**
+ * @brief   Task to drive led strip.
+*/
+
+static void led_task(void *arg)
+{
+	xSemaphoreTake(sync_led_task, portMAX_DELAY);
+	uint32_t red = 0;
+	uint32_t green = 0;
+	uint32_t blue = 0;
+	uint16_t hue = 0;
+	uint16_t start_rgb = 0;
+
+	//  Install RMT driver
+	ESP_LOGI(TAG, "RMT installation..");
+	rmt_config_t rmt_cfg = RMT_DEFAULT_CONFIG_TX(RMT_TX_GPIO, RMT_CHANNEL_0);
+	// Decrease counter clock twice
+	rmt_cfg.clk_div = 2;
+	ESP_ERROR_CHECK( rmt_config( &rmt_cfg ) );
+	ESP_ERROR_CHECK( rmt_driver_install( rmt_cfg.channel, 0, 0 ) );
+	ESP_LOGI(TAG, "RMT driver installed");
+
+
+	// Install led strip driver
+	ESP_LOGI(TAG, "LED strip driver installation..");
+	led_strip_config_t strip_cfg = LED_STRIP_DEFAULT_CONFIG( N_PIXELS, (led_strip_dev_t)rmt_cfg.channel);
+	// Instantiate strip
+	led_strip_t *strip = led_strip_new_rmt_sk6812(&strip_cfg);
+	if (!strip) {
+        ESP_LOGE(TAG, "install sk6812 driver failed");
+        vTaskDelete(NULL);
+	}
+
+	// Clear LED strip (turn off all LEDs)
+	ESP_ERROR_CHECK(strip->clear(strip, 100));
+	// Show simple rainbow chasing pattern
+	ESP_LOGI(TAG, "LED Rainbow Chase Start");
+	while (true) {
+		for (int i = 0; i < 3; i++) {
+			for (int j = i; j < N_PIXELS; j += 3) {
+				// Build RGB values
+				hue = j * 360 / N_PIXELS + start_rgb;
+				led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
+				// Write RGB values to strip driver
+				ESP_ERROR_CHECK(strip->set_pixel(strip, j, red, green, blue, 0));
+			}
+			// Flush RGB values to LEDs
+			ESP_ERROR_CHECK(strip->refresh(strip, 100));
+			vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
+			strip->clear(strip, 50);
+			vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
+		}
+		start_rgb += 60;
+	}
+	ESP_ERROR_CHECK( rmt_driver_uninstall( rmt_cfg.channel));
+	ESP_LOGI(TAG, "RMT driver un-installed");
+}
+
 void app_main(void)
 {
 	//Allow the second core to finish initialization
@@ -447,10 +558,9 @@ void app_main(void)
              esp_mesh_is_root_fixed() ? "root fixed" : "root not fixed",
              esp_mesh_get_topology(), esp_mesh_get_topology() ? "(chain)":"(tree)", esp_mesh_is_ps_enabled());
 
-
-
-
-
-
-
+	//Create semaphores to synchronize
+	sync_led_task = xSemaphoreCreateBinary();
+	//Create and start led driver task
+	xTaskCreatePinnedToCore(led_task, "led_task", 4096, NULL, 3, NULL, 1);
+	xSemaphoreGive(sync_led_task);
 }
