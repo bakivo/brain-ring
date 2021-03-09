@@ -1,5 +1,6 @@
 /*
  * Brain Ring App
+ * in progress
 */
 #include <string.h>
 #include "freertos/FreeRTOS.h"
