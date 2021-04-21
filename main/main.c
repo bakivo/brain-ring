@@ -24,13 +24,10 @@
 #define RMT_TX_GPIO (18)
 #define RMT_CHANNEL RMT_CHANNEL_0
 #define INIT_PIXELS_NUM 16
-#define N_PIXELS (5)
 #define REF_TASK_PRIORITY (3)
 #define CHASE_SPEED_MS (2000)
 static const char *TAG = "mesh_main";
-static const char *TEST_TAG = "mesh_numbers_producer";
 static const char *REST_TAG = "esp-rest";
-static bool should_generate = true;
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
 static bool is_mesh_connected = false;
 static int mesh_layer = -1;
@@ -39,34 +36,20 @@ static esp_netif_t *netif_sta = NULL;
 static pixel_t pixel = {0,0,0,0};
 
 static SemaphoreHandle_t sync_led_task;
+static SemaphoreHandle_t sync_mesh_tx_task;
+static SemaphoreHandle_t sync_control_task;
 
-static QueueHandle_t numbers;
 static QueueHandle_t hsv_values_handle;
+static QueueHandle_t led_task_input_handle;
+static QueueHandle_t mesh_tx_input_handle;
 
 typedef struct {
 	uint16_t hue;
 	uint8_t saturation;
 	uint8_t value;
 } hsv_t;
-static hsv_t hsv_vals;
-static hsv_t *hsv_t_ptr = &hsv_vals;
 
 httpd_handle_t start_webserver(void);
-
-
-
-static void numbers_producer(){
-	ESP_LOGI(TEST_TAG, "task started");
-	uint8_t counter = 0;
-	while (1) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        if(!should_generate) continue;
-		if (counter == 100) counter = 0;
-		ESP_LOGI(TEST_TAG, "value %d sent", counter);
-		xQueueSend(numbers, &counter, portMAX_DELAY);
-		counter++;
-	}
-}
 
 static void initialise_mdns(void)
 {
@@ -84,19 +67,20 @@ static void initialise_mdns(void)
 }
 
 static void esp_mesh_p2p_tx_main(void *arg) {
-	uint8_t val = 0;
+	xSemaphoreTake(sync_mesh_tx_task, portMAX_DELAY);
     esp_err_t err;
+    hsv_t hsv;
     mesh_addr_t route_table[10];
+    int size;
     mesh_data_t data;
-    data.size = sizeof(uint8_t);
+    data.size = sizeof(hsv_t);
     data.proto = MESH_PROTO_BIN;
     data.tos = MESH_TOS_P2P;
 
-    int size = 0;
 	while (1) {
-		xQueueReceive(numbers, &val, portMAX_DELAY);
-		ESP_LOGI(TAG,"value to send to peers: %d", val);
-		data.data = &val;
+		xQueueReceive(mesh_tx_input_handle, &hsv, portMAX_DELAY);
+		ESP_LOGI(TAG,"value to send to peers: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
+		data.data = (uint8_t*)&hsv;
 		esp_mesh_get_routing_table(route_table, 60, &size);
         for (int i = 0; i < size; i++) {
         	err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
@@ -106,7 +90,9 @@ static void esp_mesh_p2p_tx_main(void *arg) {
 }
 
 void esp_mesh_comm_p2p_start(){
-    xTaskCreate(esp_mesh_p2p_tx_main, "MPTX", 3072, NULL, 5, NULL);
+	sync_mesh_tx_task = xSemaphoreCreateBinary();
+	xTaskCreatePinnedToCore(esp_mesh_p2p_tx_main, "MPTX", 3072, NULL, 5, NULL, 1);
+	xSemaphoreGive(sync_mesh_tx_task);
 }
 
 void ip_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -348,9 +334,7 @@ static esp_err_t post_handler(httpd_req_t *req)
     ESP_LOGI(REST_TAG, "Light control: hue = %d, saturation = %d, value = %d", hsv_values.hue, hsv_values.saturation, hsv_values.value);
     cJSON_Delete(root);
     httpd_resp_sendstr(req, "Post control value successfully");
-    hsv_t_ptr = &hsv_values;
-	xQueueSend(hsv_values_handle, hsv_t_ptr, portMAX_DELAY);
-
+	xQueueSend(hsv_values_handle, &hsv_values, portMAX_DELAY);
     return ESP_OK;
 }
 
@@ -405,13 +389,13 @@ static void led_task(void *arg)
 	ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
 	// Install led strip driver
 	ESP_ERROR_CHECK(set_new_strip(RMT_CHANNEL, WS2812_GRB, INIT_PIXELS_NUM));
-
+	hsv_t hsv;
 	while(1) {
-		xQueueReceive(hsv_values_handle, hsv_t_ptr, portMAX_DELAY);
-		ESP_LOGI(TAG,"led task received: %d %d %d", hsv_t_ptr->hue, hsv_t_ptr->saturation, hsv_t_ptr->value);
-		ESP_ERROR_CHECK( hsv2rgb((uint16_t)hsv_t_ptr->hue, (uint8_t)hsv_t_ptr->saturation, (uint8_t)hsv_t_ptr->value, &pixel.r, &pixel.g, &pixel.b) );
-		clear_strip();
-		vTaskDelay(pdMS_TO_TICKS(300));
+		xQueueReceive(led_task_input_handle, &hsv, portMAX_DELAY);
+		ESP_LOGI(TAG,"led task received: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
+		ESP_ERROR_CHECK( hsv2rgb(hsv.hue, hsv.saturation, hsv.value, &pixel.r, &pixel.g, &pixel.b) );
+		//clear_strip();
+		vTaskDelay(pdMS_TO_TICKS(50));
 		ESP_LOGI(TAG,"led colors to flush: %d %d %d", pixel.r, pixel.g, pixel.b);
 
 		for (int i = 0; i < INIT_PIXELS_NUM; i++){
@@ -420,6 +404,17 @@ static void led_task(void *arg)
 		refresh_strip();
 		//vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
 
+	}
+}
+static void control_task(void *arg)
+{
+	xSemaphoreTake(sync_control_task, portMAX_DELAY);
+	hsv_t hsv;
+	while(1) {
+		xQueueReceive(hsv_values_handle, &hsv, portMAX_DELAY);
+		ESP_LOGI("Control task", "new values received and relayed");
+		//xQueueSend(mesh_tx_input_handle, &hsv, portMAX_DELAY);
+		xQueueSend(led_task_input_handle, &hsv, portMAX_DELAY);
 	}
 }
 
@@ -436,21 +431,23 @@ void app_main(void)
 	ESP_ERROR_CHECK(ret);
 
 	//Queue memory allocation for different tasks
-	numbers = xQueueCreate(10, sizeof(uint8_t));
-	hsv_values_handle = xQueueCreate(5, sizeof(hsv_t_ptr));
-	//xTaskCreate(numbers_producer, "PRODUCER1", 3072, NULL, 5, NULL);
+	hsv_values_handle = xQueueCreate(5, sizeof(hsv_t));
+	mesh_tx_input_handle = xQueueCreate(10, sizeof(hsv_t));
+	led_task_input_handle = xQueueCreate(10, sizeof(hsv_t));
 
-    //TCP/IP initialization
+//TCP/IP initialization
 	ESP_ERROR_CHECK(esp_netif_init());
 	//Event Loop initialization
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
-	//mDNS initialization
+
+//mDNS initialization
 	initialise_mdns();
 	netbiosns_init();
 	netbiosns_set_name("esp-home");
 
-	//Create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored */
+//Create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored */
 	ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
+
 	//WiFi initialization
 	wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
 	wifi_config_t wifi_config = {
@@ -467,7 +464,7 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
 	ESP_ERROR_CHECK(esp_wifi_start());
 
-	//Mesh initialization
+//Mesh initialization --------------------------------------------------
 	ESP_ERROR_CHECK(esp_mesh_init());
 	//Mesh Events handler registration
     ESP_ERROR_CHECK(esp_event_handler_instance_register(MESH_EVENT, ESP_EVENT_ANY_ID,
@@ -504,10 +501,12 @@ void app_main(void)
     ESP_LOGI(TAG, "mesh starts successfully, heap:%d, %s<%d>%s, ps:%d\n",  esp_get_minimum_free_heap_size(),
              esp_mesh_is_root_fixed() ? "root fixed" : "root not fixed",
              esp_mesh_get_topology(), esp_mesh_get_topology() ? "(chain)":"(tree)", esp_mesh_is_ps_enabled());
+// mesh initialization end ------------------------------------------------------------
+    sync_control_task = xSemaphoreCreateBinary();
+	xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 3, NULL, 0);
+	xSemaphoreGive(sync_control_task);
 
-	//Create semaphores to synchronize
-	sync_led_task = xSemaphoreCreateBinary();
-	//Create and start led driver task
-	xTaskCreatePinnedToCore(led_task, "led_task", 4096, NULL, 3, NULL, 1);
+    sync_led_task = xSemaphoreCreateBinary();
+	xTaskCreatePinnedToCore(led_task, "led_task", 8192, NULL, 3, NULL, 0);
 	xSemaphoreGive(sync_led_task);
 }
