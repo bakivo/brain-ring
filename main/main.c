@@ -18,11 +18,12 @@
 #include "cJSON.h"
 #include "esp_vfs.h"
 #include "driver/rmt.h"
-#include "led_strip.h"
-
+#include "strips.h"
 #define MDNS_INSTANCE "esp home web server"
 #define SCRATCH_BUFSIZE (1024)
 #define RMT_TX_GPIO (18)
+#define RMT_CHANNEL RMT_CHANNEL_0
+#define INIT_PIXELS_NUM 16
 #define N_PIXELS (5)
 #define REF_TASK_PRIORITY (3)
 #define CHASE_SPEED_MS (2000)
@@ -35,10 +36,20 @@ static bool is_mesh_connected = false;
 static int mesh_layer = -1;
 static mesh_addr_t mesh_parent_addr;
 static esp_netif_t *netif_sta = NULL;
+static pixel_t pixel = {0,0,0,0};
 
 static SemaphoreHandle_t sync_led_task;
 
 static QueueHandle_t numbers;
+static QueueHandle_t hsv_values_handle;
+
+typedef struct {
+	uint16_t hue;
+	uint8_t saturation;
+	uint8_t value;
+} hsv_t;
+static hsv_t hsv_vals;
+static hsv_t *hsv_t_ptr = &hsv_vals;
 
 httpd_handle_t start_webserver(void);
 
@@ -330,12 +341,16 @@ static esp_err_t post_handler(httpd_req_t *req)
     content[ret] = '\0';
 
     cJSON *root = cJSON_Parse(content);
-    int red = cJSON_GetObjectItem(root, "red")->valueint;
-    int green = cJSON_GetObjectItem(root, "green")->valueint;
-    int blue = cJSON_GetObjectItem(root, "blue")->valueint;
-    ESP_LOGI(REST_TAG, "Light control: red = %d, green = %d, blue = %d", red, green, blue);
+    hsv_t hsv_values;
+    hsv_values.hue = cJSON_GetObjectItem(root, "hue")->valueint;
+    hsv_values.saturation = cJSON_GetObjectItem(root, "saturation")->valueint;
+    hsv_values.value = cJSON_GetObjectItem(root, "value")->valueint;
+    ESP_LOGI(REST_TAG, "Light control: hue = %d, saturation = %d, value = %d", hsv_values.hue, hsv_values.saturation, hsv_values.value);
     cJSON_Delete(root);
     httpd_resp_sendstr(req, "Post control value successfully");
+    hsv_t_ptr = &hsv_values;
+	xQueueSend(hsv_values_handle, hsv_t_ptr, portMAX_DELAY);
+
     return ESP_OK;
 }
 
@@ -374,52 +389,6 @@ httpd_handle_t start_webserver(void)
     return server;
 }
 
-void led_strip_hsv2rgb(uint32_t h, uint32_t s, uint32_t v, uint32_t *r, uint32_t *g, uint32_t *b)
-{
-    h %= 360; // h -> [0,360]
-    uint32_t rgb_max = v * 2.55f;
-    uint32_t rgb_min = rgb_max * (100 - s) / 100.0f;
-
-    uint32_t i = h / 60;
-    uint32_t diff = h % 60;
-
-    // RGB adjustment amount by hue
-    uint32_t rgb_adj = (rgb_max - rgb_min) * diff / 60;
-
-    switch (i) {
-    case 0:
-        *r = rgb_max;
-        *g = rgb_min + rgb_adj;
-        *b = rgb_min;
-        break;
-    case 1:
-        *r = rgb_max - rgb_adj;
-        *g = rgb_max;
-        *b = rgb_min;
-        break;
-    case 2:
-        *r = rgb_min;
-        *g = rgb_max;
-        *b = rgb_min + rgb_adj;
-        break;
-    case 3:
-        *r = rgb_min;
-        *g = rgb_max - rgb_adj;
-        *b = rgb_max;
-        break;
-    case 4:
-        *r = rgb_min + rgb_adj;
-        *g = rgb_min;
-        *b = rgb_max;
-        break;
-    default:
-        *r = rgb_max;
-        *g = rgb_min;
-        *b = rgb_max - rgb_adj;
-        break;
-    }
-}
-
 /**
  * @brief   Task to drive led strip.
 */
@@ -427,55 +396,31 @@ void led_strip_hsv2rgb(uint32_t h, uint32_t s, uint32_t v, uint32_t *r, uint32_t
 static void led_task(void *arg)
 {
 	xSemaphoreTake(sync_led_task, portMAX_DELAY);
-	uint32_t red = 0;
-	uint32_t green = 0;
-	uint32_t blue = 0;
-	uint16_t hue = 0;
-	uint16_t start_rgb = 0;
-
+	ESP_LOGI(TAG, "led task started");
 	//  Install RMT driver
-	ESP_LOGI(TAG, "RMT installation..");
-	rmt_config_t rmt_cfg = RMT_DEFAULT_CONFIG_TX(RMT_TX_GPIO, RMT_CHANNEL_0);
-	// Decrease counter clock twice
-	rmt_cfg.clk_div = 2;
-	ESP_ERROR_CHECK( rmt_config( &rmt_cfg ) );
-	ESP_ERROR_CHECK( rmt_driver_install( rmt_cfg.channel, 0, 0 ) );
-	ESP_LOGI(TAG, "RMT driver installed");
-
-
+	rmt_config_t config = RMT_DEFAULT_CONFIG_TX(RMT_TX_GPIO, RMT_CHANNEL);
+	// set counter clock to 40MHz
+	config.clk_div = 2;
+	ESP_ERROR_CHECK(rmt_config(&config));
+	ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
 	// Install led strip driver
-	ESP_LOGI(TAG, "LED strip driver installation..");
-	led_strip_config_t strip_cfg = LED_STRIP_DEFAULT_CONFIG( N_PIXELS, (led_strip_dev_t)rmt_cfg.channel);
-	// Instantiate strip
-	led_strip_t *strip = led_strip_new_rmt_sk6812(&strip_cfg);
-	if (!strip) {
-        ESP_LOGE(TAG, "install sk6812 driver failed");
-        vTaskDelete(NULL);
-	}
+	ESP_ERROR_CHECK(set_new_strip(RMT_CHANNEL, WS2812_GRB, INIT_PIXELS_NUM));
 
-	// Clear LED strip (turn off all LEDs)
-	ESP_ERROR_CHECK(strip->clear(strip, 100));
-	// Show simple rainbow chasing pattern
-	ESP_LOGI(TAG, "LED Rainbow Chase Start");
-	while (true) {
-		for (int i = 0; i < 3; i++) {
-			for (int j = i; j < N_PIXELS; j += 3) {
-				// Build RGB values
-				hue = j * 360 / N_PIXELS + start_rgb;
-				led_strip_hsv2rgb(hue, 100, 100, &red, &green, &blue);
-				// Write RGB values to strip driver
-				ESP_ERROR_CHECK(strip->set_pixel(strip, j, red, green, blue, 0));
-			}
-			// Flush RGB values to LEDs
-			ESP_ERROR_CHECK(strip->refresh(strip, 100));
-			vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
-			strip->clear(strip, 50);
-			vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
+	while(1) {
+		xQueueReceive(hsv_values_handle, hsv_t_ptr, portMAX_DELAY);
+		ESP_LOGI(TAG,"led task received: %d %d %d", hsv_t_ptr->hue, hsv_t_ptr->saturation, hsv_t_ptr->value);
+		ESP_ERROR_CHECK( hsv2rgb((uint16_t)hsv_t_ptr->hue, (uint8_t)hsv_t_ptr->saturation, (uint8_t)hsv_t_ptr->value, &pixel.r, &pixel.g, &pixel.b) );
+		clear_strip();
+		vTaskDelay(pdMS_TO_TICKS(300));
+		ESP_LOGI(TAG,"led colors to flush: %d %d %d", pixel.r, pixel.g, pixel.b);
+
+		for (int i = 0; i < INIT_PIXELS_NUM; i++){
+			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
 		}
-		start_rgb += 60;
+		refresh_strip();
+		//vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
+
 	}
-	ESP_ERROR_CHECK( rmt_driver_uninstall( rmt_cfg.channel));
-	ESP_LOGI(TAG, "RMT driver un-installed");
 }
 
 void app_main(void)
@@ -490,9 +435,10 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK(ret);
 
-	//Queue memory allocation for number producer task
+	//Queue memory allocation for different tasks
 	numbers = xQueueCreate(10, sizeof(uint8_t));
-	xTaskCreate(numbers_producer, "PRODUCER1", 3072, NULL, 5, NULL);
+	hsv_values_handle = xQueueCreate(5, sizeof(hsv_t_ptr));
+	//xTaskCreate(numbers_producer, "PRODUCER1", 3072, NULL, 5, NULL);
 
     //TCP/IP initialization
 	ESP_ERROR_CHECK(esp_netif_init());
