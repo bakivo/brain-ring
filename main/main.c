@@ -19,7 +19,7 @@
 #include "esp_vfs.h"
 #include "driver/rmt.h"
 #include "strips.h"
-#define MDNS_INSTANCE "esp home web server"
+#define MDNS_INSTANCE "esp neopixel http server: "
 #define SCRATCH_BUFSIZE (1024)
 #define RMT_TX_GPIO (18)
 #define RMT_CHANNEL RMT_CHANNEL_0
@@ -40,6 +40,7 @@ static SemaphoreHandle_t sync_mesh_tx_task;
 static SemaphoreHandle_t sync_control_task;
 
 static QueueHandle_t hsv_values_handle;
+static QueueHandle_t rgb_values_handle;
 static QueueHandle_t led_task_input_handle;
 static QueueHandle_t mesh_tx_input_handle;
 
@@ -48,6 +49,12 @@ typedef struct {
 	uint8_t saturation;
 	uint8_t value;
 } hsv_t;
+
+typedef struct {
+	uint8_t red;
+	uint8_t green;
+	uint8_t blue;
+} color_t;
 
 httpd_handle_t start_webserver(void);
 
@@ -62,7 +69,7 @@ static void initialise_mdns(void)
         {"path", "/"}
     };
 
-    ESP_ERROR_CHECK(mdns_service_add("ESP32-WebServer", "_http", "_tcp", 80, serviceTxtData,
+    ESP_ERROR_CHECK(mdns_service_add("ESP32-Mesh-root", "_http", "_tcp", 80, serviceTxtData,
                                      sizeof(serviceTxtData) / sizeof(serviceTxtData[0])));
 }
 
@@ -308,7 +315,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
-/* Simple handler for light brightness control */
+/* Simple handler for POST request containing JSON with Hue, Saturation and Value values */
 static esp_err_t post_handler(httpd_req_t *req)
 {
     char content[100];
@@ -338,6 +345,36 @@ static esp_err_t post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Simple handler for POST request containing Red, Green and Blue components of color */
+static esp_err_t rgb_post_handler(httpd_req_t *req)
+{
+    char content[100];
+    size_t recv_size = req->content_len;
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) {  /* 0 return value indicates connection closed */
+		/* Check if timeout occurred */
+		if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+			/* In case of timeout one can choose to retry calling
+			 * httpd_req_recv(), but to keep it simple, here we
+			 * respond with an HTTP 408 (Request Timeout) error */
+			httpd_resp_send_408(req);
+		}
+		return ESP_FAIL;
+	}
+    content[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(content);
+    color_t color;
+    color.red = cJSON_GetObjectItem(root, "red")->valueint;
+    color.green = cJSON_GetObjectItem(root, "green")->valueint;
+    color.blue = cJSON_GetObjectItem(root, "blue")->valueint;
+    ESP_LOGI(REST_TAG, "obtained from http POST: red = %d, green = %d, blue = %d", color.red, color.green, color.blue);
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "Post control value successfully");
+	xQueueSend(rgb_values_handle, &color, portMAX_DELAY);
+    return ESP_OK;
+}
+
 //Function for starting the webserver
 httpd_handle_t start_webserver(void)
 {
@@ -359,15 +396,24 @@ httpd_handle_t start_webserver(void)
     		.user_ctx = NULL
     	};
 
-    	httpd_uri_t uri_post = {
+    	httpd_uri_t uri_post1 = {
     		.uri = "/hue",
     		.method = HTTP_POST,
     		.handler = post_handler,
     		.user_ctx = NULL
     	};
+
+    	httpd_uri_t uri_post2 = {
+    	    		.uri = "/rgb",
+    	    		.method = HTTP_POST,
+    	    		.handler = rgb_post_handler,
+    	    		.user_ctx = NULL
+    	    	};
+
         /* Register URI handlers */
         httpd_register_uri_handler(server, &uri_get);
-        httpd_register_uri_handler(server, &uri_post);
+        httpd_register_uri_handler(server, &uri_post1);
+        httpd_register_uri_handler(server, &uri_post2);
     }
     /* If server failed to start, handle will be NULL */
     return server;
@@ -389,14 +435,15 @@ static void led_task(void *arg)
 	ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
 	// Install led strip driver
 	ESP_ERROR_CHECK(set_new_strip(RMT_CHANNEL, WS2812_GRB, INIT_PIXELS_NUM));
-	hsv_t hsv;
+	//hsv_t hsv;
+	color_t color;
 	while(1) {
-		xQueueReceive(led_task_input_handle, &hsv, portMAX_DELAY);
-		ESP_LOGI(TAG,"led task received: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
-		ESP_ERROR_CHECK( hsv2rgb(hsv.hue, hsv.saturation, hsv.value, &pixel.r, &pixel.g, &pixel.b) );
+		xQueueReceive(led_task_input_handle, &color, portMAX_DELAY);
+		//ESP_LOGI(TAG,"led task received: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
+		//ESP_ERROR_CHECK( hsv2rgb(hsv.hue, hsv.saturation, hsv.value, &pixel.r, &pixel.g, &pixel.b) );
 		//clear_strip();
 		vTaskDelay(pdMS_TO_TICKS(50));
-		ESP_LOGI(TAG,"led colors to flush: %d %d %d", pixel.r, pixel.g, pixel.b);
+		ESP_LOGI(TAG,"led colors to flush: %d %d %d", color.red, color.green, color.blue);
 
 		for (int i = 0; i < INIT_PIXELS_NUM; i++){
 			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
@@ -409,20 +456,20 @@ static void led_task(void *arg)
 static void control_task(void *arg)
 {
 	xSemaphoreTake(sync_control_task, portMAX_DELAY);
-	hsv_t hsv;
+	//hsv_t hsv;
+	color_t color;
 	while(1) {
-		xQueueReceive(hsv_values_handle, &hsv, portMAX_DELAY);
-		ESP_LOGI("Control task", "new values received and relayed");
-		//xQueueSend(mesh_tx_input_handle, &hsv, portMAX_DELAY);
-		xQueueSend(led_task_input_handle, &hsv, portMAX_DELAY);
+		xQueueReceive(rgb_values_handle, &color, portMAX_DELAY); ESP_LOGI("Control task", "new values received and relayed");
+		xQueueSend(mesh_tx_input_handle, &color, portMAX_DELAY);
+		xQueueSend(led_task_input_handle, &color, portMAX_DELAY);
 	}
 }
 
 void app_main(void)
 {
-	//Allow the second core to finish initialization
+// Allow the second core to finish initialization
 	vTaskDelay(pdMS_TO_TICKS(100));
-	//NVS initialization
+// NVS initialization
 	esp_err_t ret = nvs_flash_init();
 	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 	  ESP_ERROR_CHECK(nvs_flash_erase());
@@ -430,25 +477,26 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK(ret);
 
-	//Queue memory allocation for different tasks
+// Queue memory allocation for different tasks
 	hsv_values_handle = xQueueCreate(5, sizeof(hsv_t));
-	mesh_tx_input_handle = xQueueCreate(10, sizeof(hsv_t));
-	led_task_input_handle = xQueueCreate(10, sizeof(hsv_t));
+	rgb_values_handle = xQueueCreate(5, sizeof(color_t));
+	mesh_tx_input_handle = xQueueCreate(10, sizeof(color_t));
+	led_task_input_handle = xQueueCreate(10, sizeof(color_t));
 
-//TCP/IP initialization
+// TCP/IP initialization
 	ESP_ERROR_CHECK(esp_netif_init());
 	//Event Loop initialization
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-//mDNS initialization
+// mDNS initialization
 	initialise_mdns();
 	netbiosns_init();
 	netbiosns_set_name("esp-home");
 
-//Create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored */
+// Create network interfaces for mesh (only station instance saved for further manipulation, soft AP instance ignored */
 	ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, NULL));
 
-	//WiFi initialization
+// ******************** WiFi initialization **********************************************
 	wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
 	wifi_config_t wifi_config = {
 		.sta = {
@@ -464,7 +512,7 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
 	ESP_ERROR_CHECK(esp_wifi_start());
 
-//Mesh initialization --------------------------------------------------
+// ******************** Mesh initialization **********************************************
 	ESP_ERROR_CHECK(esp_mesh_init());
 	//Mesh Events handler registration
     ESP_ERROR_CHECK(esp_event_handler_instance_register(MESH_EVENT, ESP_EVENT_ANY_ID,
@@ -501,7 +549,9 @@ void app_main(void)
     ESP_LOGI(TAG, "mesh starts successfully, heap:%d, %s<%d>%s, ps:%d\n",  esp_get_minimum_free_heap_size(),
              esp_mesh_is_root_fixed() ? "root fixed" : "root not fixed",
              esp_mesh_get_topology(), esp_mesh_get_topology() ? "(chain)":"(tree)", esp_mesh_is_ps_enabled());
-// mesh initialization end ------------------------------------------------------------
+
+//  ************************ Tasks creation **************************************************************
+
     sync_control_task = xSemaphoreCreateBinary();
 	xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 3, NULL, 0);
 	xSemaphoreGive(sync_control_task);
