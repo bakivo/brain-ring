@@ -77,17 +77,18 @@ static void esp_mesh_p2p_tx_main(void *arg) {
 	xSemaphoreTake(sync_mesh_tx_task, portMAX_DELAY);
     esp_err_t err;
     hsv_t hsv;
+    color_t color;
     mesh_addr_t route_table[10];
     int size;
     mesh_data_t data;
-    data.size = sizeof(hsv_t);
+    data.size = sizeof(color_t);
     data.proto = MESH_PROTO_BIN;
     data.tos = MESH_TOS_P2P;
 
 	while (1) {
-		xQueueReceive(mesh_tx_input_handle, &hsv, portMAX_DELAY);
-		ESP_LOGI(TAG,"value to send to peers: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
-		data.data = (uint8_t*)&hsv;
+		xQueueReceive(mesh_tx_input_handle, &color, portMAX_DELAY);
+		//ESP_LOGI(TAG,"value to send to peers: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
+		data.data = (uint8_t*)&color;
 		esp_mesh_get_routing_table(route_table, 60, &size);
         for (int i = 0; i < size; i++) {
         	err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
@@ -443,7 +444,10 @@ static void led_task(void *arg)
 		//ESP_ERROR_CHECK( hsv2rgb(hsv.hue, hsv.saturation, hsv.value, &pixel.r, &pixel.g, &pixel.b) );
 		//clear_strip();
 		vTaskDelay(pdMS_TO_TICKS(50));
-		ESP_LOGI(TAG,"led colors to flush: %d %d %d", color.red, color.green, color.blue);
+		pixel.r = color.red;
+		pixel.g = color.green;
+		pixel.b = color.blue;
+		ESP_LOGI(TAG,"led colors to flush: %d %d %d", pixel.r, pixel.g, pixel.b);
 
 		for (int i = 0; i < INIT_PIXELS_NUM; i++){
 			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
