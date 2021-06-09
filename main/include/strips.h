@@ -19,6 +19,11 @@ typedef enum {
 	STRIP_ENUM_TOTAL
 } strip_name_t;
 
+typedef enum {
+	CERTAIN_COLOR,
+	COLOR_SWITCHING,
+	RAINBOW
+} strip_control_modes_t;
 
 typedef struct pixel_s {
 	uint8_t r;

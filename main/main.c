@@ -19,6 +19,8 @@
 #include "esp_vfs.h"
 #include "driver/rmt.h"
 #include "strips.h"
+#include "utils.h"
+
 #define MDNS_INSTANCE "esp neopixel http server: "
 #define SCRATCH_BUFSIZE (1024)
 #define RMT_TX_GPIO (18)
@@ -41,6 +43,7 @@ static SemaphoreHandle_t sync_control_task;
 
 static QueueHandle_t hsv_values_handle;
 static QueueHandle_t rgb_values_handle;
+static QueueHandle_t strip_modes_handle;
 static QueueHandle_t led_task_input_handle;
 static QueueHandle_t mesh_tx_input_handle;
 
@@ -375,6 +378,34 @@ static esp_err_t rgb_post_handler(httpd_req_t *req)
 	xQueueSend(rgb_values_handle, &color, portMAX_DELAY);
     return ESP_OK;
 }
+// strip's mode http post method handler
+static esp_err_t set_mode_post_handler(httpd_req_t *req)
+{
+    ESP_LOGI(REST_TAG, "req_length = %d, uri = %s", req->content_len, req->uri);
+    char content[100];
+    size_t recv_size = req->content_len;
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) {  /* 0 return value indicates connection closed */
+		/* Check if timeout occurred */
+		if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+			/* In case of timeout one can choose to retry calling
+			 * httpd_req_recv(), but to keep it simple, here we
+			 * respond with an HTTP 408 (Request Timeout) error */
+			httpd_resp_send_408(req);
+		}
+		return ESP_FAIL;
+	}
+    content[ret] = '\0';
+
+    cJSON *root = cJSON_Parse(content);
+
+    uint8_t mode = cJSON_GetObjectItem(root, "mode")->valueint;
+    ESP_LOGI(REST_TAG, "obtained from set mode http POST: %d", mode);
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "Post control value successfully");
+	xQueueSend(strip_modes_handle, &mode, portMAX_DELAY);
+    return ESP_OK;
+}
 
 //Function for starting the webserver
 httpd_handle_t start_webserver(void)
@@ -409,12 +440,21 @@ httpd_handle_t start_webserver(void)
     	    		.method = HTTP_POST,
     	    		.handler = rgb_post_handler,
     	    		.user_ctx = NULL
-    	    	};
+    	};
+
+    	httpd_uri_t uri_post3 = {
+    	    		.uri = "/mode",
+    	    		.method = HTTP_POST,
+    	    		.handler = set_mode_post_handler,
+    	    		.user_ctx = NULL
+    	};
 
         /* Register URI handlers */
         httpd_register_uri_handler(server, &uri_get);
         httpd_register_uri_handler(server, &uri_post1);
         httpd_register_uri_handler(server, &uri_post2);
+        httpd_register_uri_handler(server, &uri_post3);
+
     }
     /* If server failed to start, handle will be NULL */
     return server;
@@ -464,6 +504,7 @@ static void control_task(void *arg)
 	color_t color;
 	while(1) {
 		xQueueReceive(rgb_values_handle, &color, portMAX_DELAY); ESP_LOGI("Control task", "new values received and relayed");
+
 		xQueueSend(mesh_tx_input_handle, &color, portMAX_DELAY);
 		xQueueSend(led_task_input_handle, &color, portMAX_DELAY);
 	}
@@ -484,6 +525,7 @@ void app_main(void)
 // Queue memory allocation for different tasks
 	hsv_values_handle = xQueueCreate(5, sizeof(hsv_t));
 	rgb_values_handle = xQueueCreate(5, sizeof(color_t));
+	strip_modes_handle = xQueueCreate(1, sizeof(uint8_t));
 	mesh_tx_input_handle = xQueueCreate(10, sizeof(color_t));
 	led_task_input_handle = xQueueCreate(10, sizeof(color_t));
 
