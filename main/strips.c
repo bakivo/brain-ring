@@ -121,7 +121,7 @@ void set_strip_type(strip_name_t name)
 
 esp_err_t hsv2rgb(uint16_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-	ESP_LOGI(TAG_STRIP,"hsv2rgb: %d %d %d", h, s, v);
+	//ESP_LOGI(TAG_STRIP,"hsv2rgb: %d %d %d", h, s, v);
 	esp_err_t ret;
 	STRIP_CHECK( (s <= 100) && (v <= 100), "invalid argument: value or saturation", err, ESP_ERR_INVALID_ARG );
     h %= 360; // h -> [0,360]

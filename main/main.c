@@ -23,11 +23,21 @@
 
 #define MDNS_INSTANCE "esp neopixel http server: "
 #define SCRATCH_BUFSIZE (1024)
-#define RMT_TX_GPIO (18)
+#define RMT_TX_GPIO (16)
 #define RMT_CHANNEL RMT_CHANNEL_0
-#define INIT_PIXELS_NUM 16
+#define INIT_PIXELS_NUM 50
 #define REF_TASK_PRIORITY (3)
 #define CHASE_SPEED_MS (2000)
+#define CORE_1 (0)
+#define CORE_2 (1)
+
+#define MODE_TASK_PRIO (6)
+#define MESH_TASK_PRIO (5)
+#define CONTROL_TASK_PRIO (4)
+#define DRIVER_TASK_PRIO (3)
+#define HUE_TASK_PRIO (2)
+
+static const int STRIP_TYPE = WS2812_GRB;
 static const char *TAG = "mesh_main";
 static const char *REST_TAG = "esp-rest";
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
@@ -38,14 +48,19 @@ static esp_netif_t *netif_sta = NULL;
 static pixel_t pixel = {0,0,0,0};
 
 static SemaphoreHandle_t sync_led_task;
+static SemaphoreHandle_t sync_mode_control_task;
+
 static SemaphoreHandle_t sync_mesh_tx_task;
 static SemaphoreHandle_t sync_control_task;
+static SemaphoreHandle_t sync_hue_task;
 
 static QueueHandle_t hsv_values_handle;
 static QueueHandle_t rgb_values_handle;
 static QueueHandle_t strip_modes_handle;
 static QueueHandle_t led_task_input_handle;
 static QueueHandle_t mesh_tx_input_handle;
+
+TaskHandle_t hueSimTask = NULL;
 
 typedef struct {
 	uint16_t hue;
@@ -58,6 +73,12 @@ typedef struct {
 	uint8_t green;
 	uint8_t blue;
 } color_t;
+
+enum {
+	MODE_COLOR,
+	MODE_HUE,
+	MODE_RAINBOW
+};
 
 httpd_handle_t start_webserver(void);
 
@@ -78,11 +99,12 @@ static void initialise_mdns(void)
 
 static void esp_mesh_p2p_tx_main(void *arg) {
 	xSemaphoreTake(sync_mesh_tx_task, portMAX_DELAY);
+
     esp_err_t err;
-    hsv_t hsv;
     color_t color;
-    mesh_addr_t route_table[10];
     int size;
+
+    mesh_addr_t route_table[10];
     mesh_data_t data;
     data.size = sizeof(color_t);
     data.proto = MESH_PROTO_BIN;
@@ -90,7 +112,6 @@ static void esp_mesh_p2p_tx_main(void *arg) {
 
 	while (1) {
 		xQueueReceive(mesh_tx_input_handle, &color, portMAX_DELAY);
-		//ESP_LOGI(TAG,"value to send to peers: %d %d %d", hsv.hue, hsv.saturation, hsv.value);
 		data.data = (uint8_t*)&color;
 		esp_mesh_get_routing_table(route_table, 60, &size);
         for (int i = 0; i < size; i++) {
@@ -102,7 +123,7 @@ static void esp_mesh_p2p_tx_main(void *arg) {
 
 void esp_mesh_comm_p2p_start(){
 	sync_mesh_tx_task = xSemaphoreCreateBinary();
-	xTaskCreatePinnedToCore(esp_mesh_p2p_tx_main, "MPTX", 3072, NULL, 5, NULL, 1);
+	xTaskCreatePinnedToCore(esp_mesh_p2p_tx_main, "MPTX", 8192, NULL, MESH_TASK_PRIO, NULL, CORE_1);
 	xSemaphoreGive(sync_mesh_tx_task);
 }
 
@@ -475,7 +496,7 @@ static void led_task(void *arg)
 	ESP_ERROR_CHECK(rmt_config(&config));
 	ESP_ERROR_CHECK(rmt_driver_install(config.channel, 0, 0));
 	// Install led strip driver
-	ESP_ERROR_CHECK(set_new_strip(RMT_CHANNEL, WS2812_GRB, INIT_PIXELS_NUM));
+	ESP_ERROR_CHECK(set_new_strip(RMT_CHANNEL, STRIP_TYPE, INIT_PIXELS_NUM));
 	//hsv_t hsv;
 	color_t color;
 	while(1) {
@@ -489,26 +510,82 @@ static void led_task(void *arg)
 		pixel.b = color.blue;
 		ESP_LOGI(TAG,"led colors to flush: %d %d %d", pixel.r, pixel.g, pixel.b);
 
+
 		for (int i = 0; i < INIT_PIXELS_NUM; i++){
 			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
 		}
+
+
 		refresh_strip();
 		//vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
 
 	}
 }
+
+static void rotating_hue(void *arg) {
+	xSemaphoreTake( sync_hue_task, portMAX_DELAY);
+	color_t color;
+	vTaskDelay( pdMS_TO_TICKS(1000) );
+
+	//uint16_t hue = (uint16_t)arg;
+	uint16_t hue = 180;
+	uint8_t delta = 1;
+	for ( ;; ) {
+
+		hue += delta;
+		if( hue == 360 ) delta = -1;
+		if( hue == 180 ) delta = 1;
+
+		//ESP_LOGI(TAG, "hue: %d", hue);
+		hsv2rgb(hue, 100, 10, &color.red, &color.green, &color.blue);
+		xQueueSend(rgb_values_handle, &color, portMAX_DELAY);
+		vTaskDelay( pdMS_TO_TICKS(500) );
+	}
+}
+
+static void mode_control_task(void *arg) {
+	xSemaphoreTake(sync_mode_control_task, portMAX_DELAY);
+
+	sync_hue_task = xSemaphoreCreateBinary();
+	uint8_t mode = 0;
+	uint16_t temp1 = 0;
+	while (1) {
+		xQueueReceive(strip_modes_handle, &mode, portMAX_DELAY);
+		if (mode == MODE_COLOR)
+		{
+			if (hueSimTask != NULL)
+			{
+				vTaskDelete( hueSimTask );
+				hueSimTask = NULL;
+			}
+		} else if (mode == MODE_HUE)
+		{
+			xTaskCreatePinnedToCore( rotating_hue, "rotating_hue_task", 2048, (void *)temp1, HUE_TASK_PRIO, &hueSimTask, CORE_1);
+			xSemaphoreGive( sync_hue_task );
+
+		}
+
+	}
+}
+
 static void control_task(void *arg)
 {
 	xSemaphoreTake(sync_control_task, portMAX_DELAY);
-	//hsv_t hsv;
+	// starts task which control mode of strip operating
+	sync_mode_control_task = xSemaphoreCreateBinary();
+	xTaskCreatePinnedToCore(mode_control_task, "mode_control_task", 4096, NULL, MODE_TASK_PRIO, NULL, CORE_1);
+	xSemaphoreGive(sync_mode_control_task);
+
 	color_t color;
+	// loop in which RGB values is received and relayed to the own driving task and to the Mesh
 	while(1) {
-		xQueueReceive(rgb_values_handle, &color, portMAX_DELAY); ESP_LOGI("Control task", "new values received and relayed");
+		xQueueReceive(rgb_values_handle, &color, portMAX_DELAY);
 
 		xQueueSend(mesh_tx_input_handle, &color, portMAX_DELAY);
 		xQueueSend(led_task_input_handle, &color, portMAX_DELAY);
 	}
 }
+
 
 void app_main(void)
 {
@@ -523,11 +600,11 @@ void app_main(void)
 	ESP_ERROR_CHECK(ret);
 
 // Queue memory allocation for different tasks
-	hsv_values_handle = xQueueCreate(5, sizeof(hsv_t));
+	//hsv_values_handle = xQueueCreate(5, sizeof(hsv_t));
 	rgb_values_handle = xQueueCreate(5, sizeof(color_t));
 	strip_modes_handle = xQueueCreate(1, sizeof(uint8_t));
-	mesh_tx_input_handle = xQueueCreate(10, sizeof(color_t));
-	led_task_input_handle = xQueueCreate(10, sizeof(color_t));
+	mesh_tx_input_handle = xQueueCreate(5, sizeof(color_t));
+	led_task_input_handle = xQueueCreate(5, sizeof(color_t));
 
 // TCP/IP initialization
 	ESP_ERROR_CHECK(esp_netif_init());
@@ -599,10 +676,10 @@ void app_main(void)
 //  ************************ Tasks creation **************************************************************
 
     sync_control_task = xSemaphoreCreateBinary();
-	xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, 3, NULL, 0);
+	xTaskCreatePinnedToCore(control_task, "control_task", 4096, NULL, CONTROL_TASK_PRIO, NULL, CORE_1);
 	xSemaphoreGive(sync_control_task);
 
     sync_led_task = xSemaphoreCreateBinary();
-	xTaskCreatePinnedToCore(led_task, "led_task", 8192, NULL, 3, NULL, 0);
+	xTaskCreatePinnedToCore(led_task, "led_task", 8192, NULL, DRIVER_TASK_PRIO, NULL, CORE_1);
 	xSemaphoreGive(sync_led_task);
 }
