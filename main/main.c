@@ -51,6 +51,8 @@ static SemaphoreHandle_t sync_led_task;
 static SemaphoreHandle_t sync_mode_control_task;
 
 static SemaphoreHandle_t sync_mesh_tx_task;
+static SemaphoreHandle_t sync_mesh_rx_task;
+
 static SemaphoreHandle_t sync_control_task;
 static SemaphoreHandle_t sync_hue_task;
 
@@ -121,10 +123,57 @@ static void esp_mesh_p2p_tx_main(void *arg) {
 	}
 }
 
+static void esp_mesh_p2p_rx_main(void *args){
+	xSemaphoreTake(sync_mesh_rx_task, portMAX_DELAY);
+	esp_err_t err = 0;
+	int flag = -1;
+    mesh_data_t data;
+    mesh_addr_t from;
+    uint8_t level;
+    data.proto = MESH_PROTO_BIN;
+    data.tos = MESH_TOS_P2P;
+    data.size = sizeof(uint8_t);
+	data.data = (uint8_t*)&level;
+
+
+
+	while (1) {
+		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
+		if (err != ESP_OK) {
+			ESP_LOGI(TAG, "esp_mesh_recv returned with error code %d ; data size = %d", err, data.size);
+		} else {
+			ESP_LOGI(TAG, "RX: value %d, receive from "MACSTR", size:%d", level, MAC2STR(from.addr), data.size);
+		}
+	}
+}
+
 void esp_mesh_comm_p2p_start(){
+	ESP_LOGI(TAG, "MESH P2P communication started");
 	sync_mesh_tx_task = xSemaphoreCreateBinary();
+	sync_mesh_rx_task = xSemaphoreCreateBinary();
+
 	xTaskCreatePinnedToCore(esp_mesh_p2p_tx_main, "MPTX", 8192, NULL, MESH_TASK_PRIO, NULL, CORE_1);
 	xSemaphoreGive(sync_mesh_tx_task);
+	xTaskCreatePinnedToCore(esp_mesh_p2p_rx_main, "MPRX", 8192, NULL, MESH_TASK_PRIO, NULL, CORE_1);
+	xSemaphoreGive(sync_mesh_rx_task);
+
+
+}
+
+void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+	switch (event_id) {
+	case WIFI_EVENT_AP_PROBEREQRECVED: {
+		//mesh_event_ps_duty_t *ps_duty = (mesh_event_ps_duty_t *)event_data;
+		ESP_LOGI(TAG, "<WIFI_EVENT_AP_PROBEREQRECVED>");
+	    }
+	break;
+
+	default:
+		ESP_LOGI(TAG, "<WIFI_EVENT>: Unknown id:%d", event_id);
+		break;
+	}
+
 }
 
 void ip_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -543,6 +592,25 @@ static void rotating_hue(void *arg) {
 	}
 }
 
+static void switching_blue_red(void *arg) {
+	xSemaphoreTake( sync_hue_task, portMAX_DELAY);
+	color_t color;
+	uint16_t hue;
+	bool alter = false;
+	while(1) {
+		if (alter) {
+			hue = 210;
+		}
+		else {
+			hue = 360;
+		}
+		alter = !alter;
+		hsv2rgb(hue, 100, 10, &color.red, &color.green, &color.blue);
+		xQueueSend(rgb_values_handle, &color, portMAX_DELAY);
+		vTaskDelay( pdMS_TO_TICKS(4000) );
+	}
+}
+
 static void mode_control_task(void *arg) {
 	xSemaphoreTake(sync_mode_control_task, portMAX_DELAY);
 
@@ -560,7 +628,7 @@ static void mode_control_task(void *arg) {
 			}
 		} else if (mode == MODE_HUE)
 		{
-			xTaskCreatePinnedToCore( rotating_hue, "rotating_hue_task", 2048, (void *)temp1, HUE_TASK_PRIO, &hueSimTask, CORE_1);
+			xTaskCreatePinnedToCore( switching_blue_red, "rotating_hue_task", 2048, (void *)temp1, HUE_TASK_PRIO, &hueSimTask, CORE_1);
 			xSemaphoreGive( sync_hue_task );
 
 		}
@@ -634,6 +702,7 @@ void app_main(void)
 														&ip_event_handler, NULL, NULL));
 	ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
 	ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
 
 // ******************** Mesh initialization **********************************************
 	ESP_ERROR_CHECK(esp_mesh_init());
@@ -664,7 +733,7 @@ void app_main(void)
 	memcpy((uint8_t *) &mesh_cfg.mesh_ap.password, CONFIG_MESH_AP_PASSWD, strlen(CONFIG_MESH_AP_PASSWD));
 	ESP_ERROR_CHECK(esp_mesh_set_config(&mesh_cfg));
 	/* mesh start */
-	ESP_ERROR_CHECK(esp_mesh_set_self_organized(false, false));
+	ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false));
 	//ESP_ERROR_CHECK(esp_mesh_fix_root(true));
 	ESP_ERROR_CHECK(esp_mesh_set_parent(&wifi_config, NULL, MESH_ROOT, MESH_ROOT_LAYER));
 	ESP_ERROR_CHECK(esp_mesh_start());
