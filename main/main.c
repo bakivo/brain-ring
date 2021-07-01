@@ -46,7 +46,7 @@ static int mesh_layer = -1;
 static mesh_addr_t mesh_parent_addr;
 static esp_netif_t *netif_sta = NULL;
 static pixel_t pixel = {0,0,0,0};
-
+static uint8_t nodes_at_level[CONFIG_MESH_MAX_LAYER];  
 static SemaphoreHandle_t sync_led_task;
 static SemaphoreHandle_t sync_mode_control_task;
 
@@ -63,6 +63,16 @@ static QueueHandle_t led_task_input_handle;
 static QueueHandle_t mesh_tx_input_handle;
 
 TaskHandle_t hueSimTask = NULL;
+
+typedef enum {
+    LOST_CHILD,
+    FOUND_PARENT
+} message_type_t;
+
+typedef struct {
+    message_type_t message_type;
+    uint8_t level;
+} data_from_child_t;
 
 typedef struct {
 	uint16_t hue;
@@ -129,11 +139,12 @@ static void esp_mesh_p2p_rx_main(void *args){
 	int flag = -1;
     mesh_data_t data;
     mesh_addr_t from;
+    data_from_child_t child_data;
     uint8_t level;
     data.proto = MESH_PROTO_BIN;
     data.tos = MESH_TOS_P2P;
-    data.size = sizeof(uint8_t);
-	data.data = (uint8_t*)&level;
+    data.size = sizeof(child_data);
+	data.data = (uint8_t*)&child_data;
 
 
 
@@ -142,7 +153,7 @@ static void esp_mesh_p2p_rx_main(void *args){
 		if (err != ESP_OK) {
 			ESP_LOGI(TAG, "esp_mesh_recv returned with error code %d ; data size = %d", err, data.size);
 		} else {
-			ESP_LOGI(TAG, "RX: value %d, receive from "MACSTR", size:%d", level, MAC2STR(from.addr), data.size);
+			ESP_LOGI(TAG, "RX: message type %d - value %d, received from "MACSTR", size:%d", child_data.message_type, child_data.level, MAC2STR(from.addr), data.size);
 		}
 	}
 }
