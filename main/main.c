@@ -20,6 +20,7 @@
 #include "driver/rmt.h"
 #include "strips.h"
 #include "utils.h"
+#include "network.h"
 
 #define MDNS_INSTANCE "esp neopixel http server: "
 #define SCRATCH_BUFSIZE (1024)
@@ -63,16 +64,6 @@ static QueueHandle_t led_task_input_handle;
 static QueueHandle_t mesh_tx_input_handle;
 
 TaskHandle_t hueSimTask = NULL;
-
-typedef enum {
-    LOST_CHILD,
-    FOUND_PARENT
-} message_type_t;
-
-typedef struct {
-    message_type_t message_type;
-    uint8_t level;
-} data_from_child_t;
 
 typedef struct {
 	uint16_t hue;
@@ -140,20 +131,37 @@ static void esp_mesh_p2p_rx_main(void *args){
     mesh_data_t data;
     mesh_addr_t from;
     data_from_child_t child_data;
-    uint8_t level;
+    packet_t packet;
     data.proto = MESH_PROTO_BIN;
     data.tos = MESH_TOS_P2P;
-    data.size = sizeof(child_data);
-	data.data = (uint8_t*)&child_data;
-
-
+    data.size = sizeof(packet_t);
+	data.data = (packet_t*)&packet;
 
 	while (1) {
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 		if (err != ESP_OK) {
 			ESP_LOGI(TAG, "esp_mesh_recv returned with error code %d ; data size = %d", err, data.size);
 		} else {
-			ESP_LOGI(TAG, "RX: message type %d - value %d, received from "MACSTR", size:%d", child_data.message_type, child_data.level, MAC2STR(from.addr), data.size);
+			ESP_LOGI(TAG, "RX: message type %d, received from "MACSTR", size:%d", packet.type, MAC2STR(from.addr), data.size);
+            switch (packet.type)
+            {
+            case MESH_MESSAGE:
+                ESP_LOGI(TAG,"%s", packet.message);
+                break;
+            
+            case MESH_TREE_UPDATE:
+			ESP_LOGI(TAG, ""MACSTR":"MACSTR":%d", MAC2STR(packet.child_info.mac), MAC2STR(packet.child_info.parent_mac),packet.child_info.level);
+                break;
+            
+            case MESH_USER_DATA:
+                ESP_LOGI(TAG,"USER PARAM: %d", packet.param1);
+                break;
+            
+            default:
+                ESP_LOGI(TAG,"unknown type of message received from Mesh");
+                break;
+            }
+            // ************ code ************
 		}
 	}
 }
@@ -659,9 +667,8 @@ static void control_task(void *arg)
 	// loop in which RGB values is received and relayed to the own driving task and to the Mesh
 	while(1) {
 		xQueueReceive(rgb_values_handle, &color, portMAX_DELAY);
-
-		xQueueSend(mesh_tx_input_handle, &color, portMAX_DELAY);
-		xQueueSend(led_task_input_handle, &color, portMAX_DELAY);
+		xQueueSend(led_task_input_handle, &color, pdMS_TO_TICKS(3000));
+		xQueueSend(mesh_tx_input_handle, &color, pdMS_TO_TICKS(3000));
 	}
 }
 
