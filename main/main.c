@@ -28,6 +28,7 @@
 #define INIT_PIXELS_NUM (10)
 #define REF_TASK_PRIORITY (3)
 #define CHASE_SPEED_MS (100)
+#define ROTATION_SPEED_MS (1000)
 #define CORE_1 (0)
 #define CORE_2 (1)
 #define MODE_TASK_PRIO (6)
@@ -92,7 +93,8 @@ typedef enum {
     MODE_SWITCH_COLOR,
 	MODE_COLOR
 } led_mode_t;
-
+static uint8_t rotation_speed = ROTATION_SPEED_MS;
+static int8_t led_mode;
 #define DEFAULT_LED_MODE (MODE_ROTATING_HUE)
 
 httpd_handle_t start_webserver(void);
@@ -534,19 +536,54 @@ static esp_err_t set_mode_post_handler(httpd_req_t *req)
 	xQueueSend(strip_modes_handle, &mode, portMAX_DELAY);
     return ESP_OK;
 }
+// speed of rotation
+static esp_err_t set_speed_post_handler(httpd_req_t *req)
+{
+    ESP_LOGI(REST_TAG, "req_length = %d, uri = %s", req->content_len, req->uri);
+    char content[100];
+    size_t recv_size = req->content_len;
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) {  /* 0 return value indicates connection closed */
+		/* Check if timeout occurred */
+		if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+			/* In case of timeout one can choose to retry calling
+			 * httpd_req_recv(), but to keep it simple, here we
+			 * respond with an HTTP 408 (Request Timeout) error */
+			httpd_resp_send_408(req);
+		}
+		return ESP_FAIL;
+	}
+    content[ret] = '\0';
 
+    cJSON *root = cJSON_Parse(content);
+    if (!root) {
+        ESP_LOGI(TAG, "received not JSON");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    cJSON *json_element = cJSON_GetObjectItem(root, "speed");
+    if ( cJSON_IsNumber(json_element) == false) {
+        ESP_LOGI(TAG, "JSON parser did not recognise key : speed");
+        return ESP_ERR_NOT_SUPPORTED;
+    };
+
+    int32_t speed = json_element->valueint;
+    if ( (speed < 100) || (speed > 10000) ) {
+        ESP_LOGI(TAG, "JSON parser key : speed is of out accaptable range 100..10000 ms");
+        return ESP_ERR_INVALID_ARG;
+    }
+    ESP_LOGI(REST_TAG, "obtained from set speed http POST: %d", speed);
+    rotation_speed = speed;
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "Post control value successfully");
+    return ESP_OK;
+}
 //Function for starting the webserver
 httpd_handle_t start_webserver(void)
 {
     ESP_LOGI(REST_TAG, "Starting HTTP Server");
-    //Generate default configuration
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-
-    //Empty handle to esp_http_server
     httpd_handle_t server = NULL;
-
-
-    /* Start the httpd server */
     if (httpd_start(&server, &config) == ESP_OK) {
 
     	httpd_uri_t uri_get = {
@@ -576,12 +613,19 @@ httpd_handle_t start_webserver(void)
     	    		.handler = set_mode_post_handler,
     	    		.user_ctx = NULL
     	};
+        httpd_uri_t uri_post4 = {
+    	    		.uri = "/speed",
+    	    		.method = HTTP_POST,
+    	    		.handler = set_speed_post_handler,
+    	    		.user_ctx = NULL
+    	};
 
         /* Register URI handlers */
         httpd_register_uri_handler(server, &uri_get);
         httpd_register_uri_handler(server, &uri_post1);
         httpd_register_uri_handler(server, &uri_post2);
         httpd_register_uri_handler(server, &uri_post3);
+        httpd_register_uri_handler(server, &uri_post4);
 
     }
     /* If server failed to start, handle will be NULL */
@@ -635,7 +679,7 @@ static void rotating_hue(void *arg) {
 		}
 		refresh_strip();
 		xQueueSend(mesh_tx_input_handle, &color, 0);
-		vTaskDelay( pdMS_TO_TICKS(1000) );
+		vTaskDelay( pdMS_TO_TICKS(rotation_speed) );
 	}
 }
 
@@ -714,22 +758,27 @@ esp_err_t switch_led_mode(led_mode_t mode) {
     case MODE_ROTATING_HUE:
         xTaskCreatePinnedToCore( rotating_hue, "rotating hue task", 4096, NULL, 2, &hue_sim_task, CORE_1);
         xSemaphoreGive( sync_hue_task );
+        led_mode = MODE_ROTATING_HUE;
         break;
     case MODE_RAINBOW:
         xTaskCreatePinnedToCore( rainbow_task, "rainbow_task", 4096, NULL, 2, &rainbow_sim_task, CORE_1);
         xSemaphoreGive( sync_rainbow_task );
+        led_mode = MODE_RAINBOW;
         break;
     case MODE_SWITCH_COLOR:
         xTaskCreatePinnedToCore( switching_blue_red, "switching blue red task", 4096, NULL, 2, &color_switch_sim_task, CORE_1);
         xSemaphoreGive( sync_switch_color_task );
+        led_mode = MODE_SWITCH_COLOR;
         break;
     case MODE_COLOR:
         xTaskCreatePinnedToCore( led_task, "one color task", 4096, NULL, 2, &one_color_sim_task, CORE_1);
         xSemaphoreGive( sync_color_task );
+        led_mode = MODE_COLOR;
         break;
 
     default:
         ESP_LOGI(TAG, "unknown strip mode: %d", mode);
+        led_mode = -1;
         break;
     }
     return 0;
