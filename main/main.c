@@ -45,7 +45,6 @@ static int mesh_layer = -1;
 static mesh_addr_t mesh_parent_addr;
 static esp_netif_t *netif_sta = NULL;
 static pixel_t pixel = {0,0,0,0};
-static uint8_t nodes_at_level[CONFIG_MESH_MAX_LAYER];  
 
 static SemaphoreHandle_t sync_control_task;
 static SemaphoreHandle_t sync_mode_control_task;
@@ -58,12 +57,6 @@ static QueueHandle_t rgb_values_handle;
 static QueueHandle_t strip_modes_handle;
 static QueueHandle_t led_task_input_handle;
 static QueueHandle_t mesh_tx_input_handle;
-
-static TaskHandle_t test_task1_hdl;
-static SemaphoreHandle_t test1_task_sync;
-static TaskHandle_t test_task2_hdl;
-static SemaphoreHandle_t test2_task_sync;
-static TaskHandle_t *test_tasks[] = {&test_task1_hdl, &test_task2_hdl};
 
 static SemaphoreHandle_t sync_hue_task;
 static SemaphoreHandle_t sync_rainbow_task;
@@ -99,8 +92,8 @@ typedef enum {
     MODE_SWITCH_COLOR,
 	MODE_COLOR
 } led_mode_t;
-static int8_t led_mode;
-#define DEFAULT_LED_MODE (MODE_RAINBOW)
+
+#define DEFAULT_LED_MODE (MODE_ROTATING_HUE)
 
 httpd_handle_t start_webserver(void);
 
@@ -138,8 +131,11 @@ static void esp_mesh_p2p_tx_main(void *arg) {
 		esp_mesh_get_routing_table(route_table, 60, &size);
         for (int i = 0; i < size; i++) {
             memcpy(mac, &route_table[i].addr, 6);
-            ESP_LOGI(TAG, "<MESH_MAC>: %d element in routing table:, "MACSTR"", i, MAC2STR(mac));
-
+            //ESP_LOGI(TAG, "<MESH_MAC>: %d element in routing table:, "MACSTR"", i, MAC2STR(mac));
+            if ( (mac[4] == mesh_own_mac[4]) && (mac[5] == mesh_own_mac[5])) {
+                continue;
+            }
+            
         	err = esp_mesh_send(&route_table[i], &data, MESH_DATA_P2P, NULL, 0);
         	if(err != ESP_OK) ESP_LOGI(TAG, "esp_mesh_send returned with error code %d", err);
         }
@@ -158,7 +154,7 @@ static void esp_mesh_p2p_rx_main(void *args){
     data.size = sizeof(packet_t);
 	data.data = (packet_t*)&packet;
 
-	while (1) {
+	while (true) {
 		err = esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0);
 		if (err != ESP_OK) {
 			ESP_LOGI(TAG, "esp_mesh_recv returned with error code %d ; data size = %d", err, data.size);
@@ -182,7 +178,6 @@ static void esp_mesh_p2p_rx_main(void *args){
                 ESP_LOGI(TAG,"unknown type of message received from Mesh");
                 break;
             }
-            // ************ code ************
 		}
 	}
 }
@@ -221,7 +216,9 @@ void ip_event_handler(void *event_handler_arg, esp_event_base_t event_base, int3
 	if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
 		ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
 		ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-		start_webserver();
+		if (start_webserver() == NULL) {
+            ESP_LOGI(TAG, "webserver failed to start");
+        }
 	}
 }
 
@@ -249,14 +246,6 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
         ESP_LOGI(TAG, "<MESH_EVENT_CHILD_CONNECTED>aid:%d, "MACSTR"", child_connected->aid, MAC2STR(child_connected->mac));
         // to pass info about new child to graph API function, the self mac and layer to be added in addition to child'd mac
         // invoke esp_mesh_get_layer();
-        if (esp_mesh_is_root())
-        {
-            /* code */
-        }
-        
-
-
-
     }
     break;
     case MESH_EVENT_CHILD_DISCONNECTED: {
@@ -428,10 +417,6 @@ void mesh_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
     }
 }
 
-void mesh_init(){
-
-}
-
 static esp_err_t get_handler(httpd_req_t *req) {
     ESP_LOGI(REST_TAG, "req_length = %d, uri = %s", req->content_len, req->uri);
 
@@ -458,14 +443,27 @@ static esp_err_t post_handler(httpd_req_t *req)
     content[ret] = '\0';
 
     cJSON *root = cJSON_Parse(content);
-    hsv_t hsv_values;
-    hsv_values.hue = cJSON_GetObjectItem(root, "hue")->valueint;
-    hsv_values.saturation = cJSON_GetObjectItem(root, "saturation")->valueint;
-    hsv_values.value = cJSON_GetObjectItem(root, "value")->valueint;
-    ESP_LOGI(REST_TAG, "Light control: hue = %d, saturation = %d, value = %d", hsv_values.hue, hsv_values.saturation, hsv_values.value);
+    ESP_LOGI(TAG, "length: %d ; has body: %s", ret, root ? "true" : "false" );
+    if (!root)
+    {
+        ESP_LOGI(TAG, "not JSON received");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    cJSON *json_element = cJSON_GetObjectItem(root, "hue");
+    if ( cJSON_IsNumber(json_element) == false) {
+        ESP_LOGI(TAG, "JSON parser hue not found");
+        return ESP_ERR_NOT_SUPPORTED;
+    };
+    
+    ESP_LOGI(REST_TAG, "Light control: hue = %d", json_element->valueint);
+
+    //hsv_t hsv_values;
+    //hsv_values.hue = cJSON_GetObjectItem(root, "hue")->valueint;
+    //hsv_values.saturation = cJSON_GetObjectItem(root, "saturation")->valueint;
+    //hsv_values.value = cJSON_GetObjectItem(root, "value")->valueint;
     cJSON_Delete(root);
     httpd_resp_sendstr(req, "Post control value successfully");
-	xQueueSend(hsv_values_handle, &hsv_values, portMAX_DELAY);
+	//xQueueSend(hsv_values_handle, &hsv_values, portMAX_DELAY);
     return ESP_OK;
 }
 
@@ -518,8 +516,18 @@ static esp_err_t set_mode_post_handler(httpd_req_t *req)
     content[ret] = '\0';
 
     cJSON *root = cJSON_Parse(content);
+    if (!root) {
+        ESP_LOGI(TAG, "received not JSON");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    cJSON *json_element = cJSON_GetObjectItem(root, "mode");
+    if ( cJSON_IsNumber(json_element) == false) {
+        ESP_LOGI(TAG, "JSON parser did not recognise key : mode");
+        return ESP_ERR_NOT_SUPPORTED;
+    };
 
-    uint8_t mode = cJSON_GetObjectItem(root, "mode")->valueint;
+    uint8_t mode = json_element->valueint;
     ESP_LOGI(REST_TAG, "obtained from set mode http POST: %d", mode);
     cJSON_Delete(root);
     httpd_resp_sendstr(req, "Post control value successfully");
@@ -601,6 +609,8 @@ static void led_task(void *arg)
 			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
 		}
 		refresh_strip();
+
+		xQueueSend(mesh_tx_input_handle, &color, 0);
 	}
 }
 // TODO brightness control and speed
@@ -608,6 +618,7 @@ static void rotating_hue(void *arg) {
 	xSemaphoreTake( sync_hue_task, portMAX_DELAY);
     ESP_LOGI(TAG, "LED Rotating Colors Start");
 	pixel_t pixel = { .white = 0 };
+    color_t color;
 	//uint16_t hue = (uint16_t)arg;
 	uint16_t hue = 180;
 	int8_t delta = 1;
@@ -616,11 +627,14 @@ static void rotating_hue(void *arg) {
 		if( hue == 360 ) delta = -1;
 		if( hue == 180 ) delta = 1;
 		hsv2rgb(hue, 100, 10, &pixel.r, &pixel.g, &pixel.b);
+        color.red = pixel.r;
+        color.green = pixel.g;
+        color.blue = pixel.b;
         for (int i = 0; i < INIT_PIXELS_NUM; i++){
 			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
 		}
 		refresh_strip();
-		//xQueueSend(rgb_values_handle, &color, portMAX_DELAY);
+		xQueueSend(mesh_tx_input_handle, &color, 0);
 		vTaskDelay( pdMS_TO_TICKS(1000) );
 	}
 }
@@ -628,7 +642,7 @@ static void rotating_hue(void *arg) {
 static void switching_blue_red(void *arg) {
 	xSemaphoreTake( sync_switch_color_task, portMAX_DELAY);
     ESP_LOGI(TAG, "LED switching color Start");
-
+    pixel_t pixel = { .white = 0 };
 	color_t color;
 	uint16_t hue;
 	bool alter = false;
@@ -641,8 +655,16 @@ static void switching_blue_red(void *arg) {
 		}
 		alter = !alter;
 		hsv2rgb(hue, 100, 10, &color.red, &color.green, &color.blue);
-		xQueueSend(rgb_values_handle, &color, portMAX_DELAY);
-		vTaskDelay( pdMS_TO_TICKS(4000) );
+        pixel.r = color.red;
+		pixel.g = color.green;
+		pixel.b = color.blue;
+		
+        for (int i = 0; i < INIT_PIXELS_NUM; i++) {
+			ESP_ERROR_CHECK( set_pixel(i, &pixel) );
+		}
+		refresh_strip();
+		xQueueSend(mesh_tx_input_handle, &color, 0);
+        vTaskDelay( pdMS_TO_TICKS(4000) );
 	}
 }
 
@@ -672,23 +694,6 @@ static void rainbow_task(void *args) {
         shift += 60;
     }
     
-}
-
-static void test_task1(void *arg) {
-    ESP_LOGI(TAG, "test task1 started");
-    while (true)
-    {
-        ESP_LOGI(TAG, "test task1 iter");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }   
-}
-static void test_task2(void *arg) {
-    ESP_LOGI(TAG, "test task2 started");
-    while (true)
-    {
-        ESP_LOGI(TAG, "test task2 iter");
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }   
 }
 
 esp_err_t switch_led_mode(led_mode_t mode) {
@@ -767,7 +772,7 @@ static void control_task(void *arg)
 	while(1) {
 		xQueueReceive(rgb_values_handle, &color, portMAX_DELAY);
 		xQueueSend(led_task_input_handle, &color, pdMS_TO_TICKS(3000));
-		xQueueSend(mesh_tx_input_handle, &color, pdMS_TO_TICKS(3000));
+		//xQueueSend(mesh_tx_input_handle, &color, pdMS_TO_TICKS(3000));
 	}
 }
 
