@@ -25,9 +25,9 @@
 #define SCRATCH_BUFSIZE (1024)
 #define RMT_TX_GPIO (16)
 #define RMT_CHANNEL RMT_CHANNEL_0
-#define INIT_PIXELS_NUM (10)
+#define INIT_PIXELS_NUM (36)
 #define REF_TASK_PRIORITY (3)
-#define CHASE_SPEED_MS (100)
+#define CHASE_SPEED_MS (10)
 #define ROTATION_SPEED_MS (1000)
 #define CORE_1 (0)
 #define CORE_2 (1)
@@ -36,7 +36,7 @@
 #define CONTROL_TASK_PRIO (4)
 #define DRIVER_TASK_PRIO (3)
 #define HUE_TASK_PRIO (2)
-static const int STRIP_TYPE = SK6812_RGBW;
+static const int STRIP_TYPE = WS2812_GRB;
 static const char *TAG = "mesh_main";
 static const char *REST_TAG = "esp-rest";
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
@@ -95,7 +95,7 @@ typedef enum {
 } led_mode_t;
 static uint8_t rotation_speed = ROTATION_SPEED_MS;
 static int8_t led_mode;
-#define DEFAULT_LED_MODE (MODE_ROTATING_HUE)
+#define DEFAULT_LED_MODE (MODE_RAINBOW)
 
 httpd_handle_t start_webserver(void);
 
@@ -568,8 +568,8 @@ static esp_err_t set_speed_post_handler(httpd_req_t *req)
     };
 
     int32_t speed = json_element->valueint;
-    if ( (speed < 100) || (speed > 10000) ) {
-        ESP_LOGI(TAG, "JSON parser key : speed is of out accaptable range 100..10000 ms");
+    if ( (speed < 10) || (speed > 10000) ) {
+        ESP_LOGI(TAG, "JSON parser key : speed is of out accaptable range 10..10000 ms");
         return ESP_ERR_INVALID_ARG;
     }
     ESP_LOGI(REST_TAG, "obtained from set speed http POST: %d", speed);
@@ -698,7 +698,7 @@ static void switching_blue_red(void *arg) {
 			hue = 360;
 		}
 		alter = !alter;
-		hsv2rgb(hue, 100, 10, &color.red, &color.green, &color.blue);
+		hsv2rgb(hue, 100, 3, &color.red, &color.green, &color.blue);
         pixel.r = color.red;
 		pixel.g = color.green;
 		pixel.b = color.blue;
@@ -716,26 +716,25 @@ static void rainbow_task(void *args) {
     xSemaphoreTake(sync_rainbow_task, portMAX_DELAY);
     ESP_LOGI(TAG, "LED Rainbow Chase Start");
 
-    uint8_t shift = 0;
+    uint16_t shift = 0;
     pixel_t pixel = { .white = 0 };
     uint16_t hue = 0;
+    uint16_t density = 360 / INIT_PIXELS_NUM;
     while (true)
     {
-        for (int i = 0; i < 3; i++) {
-            for (int j = i; j < INIT_PIXELS_NUM; j += 3) {
+            for (int j = 0; j < INIT_PIXELS_NUM; j += 1) {
                 // Build RGB values
-                hue = j * 360 / INIT_PIXELS_NUM + shift;
-                hsv2rgb(hue, 100, 30, &pixel.r, &pixel.g, &pixel.b);
+                hue = j * density + shift;
+                hsv2rgb(hue, 100, 5, &pixel.r, &pixel.g, &pixel.b);
                 // Write RGB values to strip driver
 			    ESP_ERROR_CHECK( set_pixel(j, &pixel) );
             }
             // Flush RGB values to LEDs
 		    refresh_strip();
-            vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
+            vTaskDelay(pdMS_TO_TICKS(100));
 		    clear_strip();
-            vTaskDelay(pdMS_TO_TICKS(CHASE_SPEED_MS));
-        }
-        shift += 60;
+            //vTaskDelay(pdMS_TO_TICKS(100));
+        shift += density;
     }
     
 }
