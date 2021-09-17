@@ -25,7 +25,7 @@
 #define SCRATCH_BUFSIZE (1024)
 #define RMT_TX_GPIO (16)
 #define RMT_CHANNEL RMT_CHANNEL_0
-#define INIT_PIXELS_NUM (36)
+#define INIT_PIXELS_NUM (10)
 #define REF_TASK_PRIORITY (3)
 #define CHASE_SPEED_MS (10)
 #define ROTATION_SPEED_MS (1000)
@@ -36,7 +36,11 @@
 #define CONTROL_TASK_PRIO (4)
 #define DRIVER_TASK_PRIO (3)
 #define HUE_TASK_PRIO (2)
-static const int STRIP_TYPE = WS2812_GRB;
+// web api
+#define HTTP_BUFFER_SIZE 50
+static char content[HTTP_BUFFER_SIZE];
+//
+static const int STRIP_TYPE = SK6812_RGBW;
 static const char *TAG = "mesh_main";
 static const char *REST_TAG = "esp-rest";
 static const uint8_t MESH_ID[6] = { 0x77, 0x77, 0x77, 0x77, 0x77, 0x77};
@@ -91,11 +95,19 @@ typedef enum {
 	MODE_ROTATING_HUE,
 	MODE_RAINBOW,
     MODE_SWITCH_COLOR,
-	MODE_COLOR
+	MODE_COLOR,
+    MODE_END
 } led_mode_t;
+
 static uint8_t rotation_speed = ROTATION_SPEED_MS;
 static int8_t led_mode;
 #define DEFAULT_LED_MODE (MODE_RAINBOW)
+
+typedef enum {
+    API_ROUTE_MODE,
+    API_ROUTE_HSV,
+    API_ROUTE_SPEED
+} api_routes_t;
 
 httpd_handle_t start_webserver(void);
 
@@ -426,6 +438,67 @@ static esp_err_t get_handler(httpd_req_t *req) {
 	return ESP_OK;
 }
 
+int post_handler_common(httpd_req_t *req, api_routes_t route_name) {
+    
+    size_t recv_size = req->content_len;
+
+    if (recv_size > HTTP_BUFFER_SIZE) {
+        ESP_LOGI(REST_TAG, "size of incoming http request is bigger then handler's buffer");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "size of incoming http request is bigger then handler's buffer");
+        return -1;
+    }
+
+    int ret = httpd_req_recv(req, content, recv_size);
+
+    if (ret <= 0) {  /* 0 return value indicates connection closed */
+		/* Check if timeout occurred */
+		if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+			/* In case of timeout one can choose to retry calling
+			 * httpd_req_recv(), but to keep it simple, here we
+			 * respond with an HTTP 408 (Request Timeout) error */
+			httpd_resp_send_408(req);
+		}
+        else if (ret == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty request");
+        }
+		return -1;
+	}
+    content[ret] = '\0';
+    cJSON *root = cJSON_Parse(content);
+    cJSON *json_element;
+    // 
+    if (!root) {
+        ESP_LOGI(REST_TAG, "received not JSON");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, NULL);
+        goto err;
+    }
+    switch (route_name) {
+    case API_ROUTE_MODE:
+        json_element = cJSON_GetObjectItem(root, "mode");
+        if (cJSON_IsNumber(json_element) == false) {
+            ESP_LOGI(REST_TAG, "JSON parser did not recognise key : mode");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, NULL);
+            goto err;
+            };
+        uint8_t mode = json_element->valueint;
+        xQueueSend(strip_modes_handle, &mode, portMAX_DELAY);
+        break;
+    
+    default:
+        break;
+    }
+
+
+    
+    
+
+    cJSON_Delete(root);
+    httpd_resp_sendstr(req, "Post control value successfully");
+    return 0;
+err:
+    cJSON_Delete(root);
+    return -1;
+}
 /* Simple handler for POST request containing JSON with Hue, Saturation and Value values */
 static esp_err_t post_handler(httpd_req_t *req)
 {
@@ -501,39 +574,8 @@ static esp_err_t rgb_post_handler(httpd_req_t *req)
 // strip's mode http post method handler
 static esp_err_t set_mode_post_handler(httpd_req_t *req)
 {
-    ESP_LOGI(REST_TAG, "req_length = %d, uri = %s", req->content_len, req->uri);
-    char content[100];
-    size_t recv_size = req->content_len;
-    int ret = httpd_req_recv(req, content, recv_size);
-    if (ret <= 0) {  /* 0 return value indicates connection closed */
-		/* Check if timeout occurred */
-		if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
-			/* In case of timeout one can choose to retry calling
-			 * httpd_req_recv(), but to keep it simple, here we
-			 * respond with an HTTP 408 (Request Timeout) error */
-			httpd_resp_send_408(req);
-		}
-		return ESP_FAIL;
-	}
-    content[ret] = '\0';
-
-    cJSON *root = cJSON_Parse(content);
-    if (!root) {
-        ESP_LOGI(TAG, "received not JSON");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    
-    cJSON *json_element = cJSON_GetObjectItem(root, "mode");
-    if ( cJSON_IsNumber(json_element) == false) {
-        ESP_LOGI(TAG, "JSON parser did not recognise key : mode");
-        return ESP_ERR_NOT_SUPPORTED;
-    };
-
-    uint8_t mode = json_element->valueint;
-    ESP_LOGI(REST_TAG, "obtained from set mode http POST: %d", mode);
-    cJSON_Delete(root);
-    httpd_resp_sendstr(req, "Post control value successfully");
-	xQueueSend(strip_modes_handle, &mode, portMAX_DELAY);
+    //ESP_LOGI(REST_TAG, "req_length = %d, uri = %s", req->content_len, req->uri);
+    post_handler_common(req, API_ROUTE_MODE);
     return ESP_OK;
 }
 // speed of rotation
@@ -739,7 +781,7 @@ static void rainbow_task(void *args) {
     
 }
 
-esp_err_t switch_led_mode(led_mode_t mode) {
+void delete_current_mode_task() {
     TaskHandle_t *task_ptr;
     char name[20];
     // delete current strip mode task
@@ -751,34 +793,54 @@ esp_err_t switch_led_mode(led_mode_t mode) {
         vTaskDelete( *task_ptr );
         *task_ptr = NULL;
     }
+}
+
+esp_err_t switch_led_mode(led_mode_t mode) {
+    SemaphoreHandle_t *sync_task = NULL;
+    bool keep_current_task = false;
     // activate new mode
     switch (mode)
     {
     case MODE_ROTATING_HUE:
+        delete_current_mode_task();
         xTaskCreatePinnedToCore( rotating_hue, "rotating hue task", 4096, NULL, 2, &hue_sim_task, CORE_1);
-        xSemaphoreGive( sync_hue_task );
+        //xSemaphoreGive( sync_hue_task );
+        sync_task = sync_hue_task;
+
         led_mode = MODE_ROTATING_HUE;
         break;
     case MODE_RAINBOW:
+        delete_current_mode_task();
         xTaskCreatePinnedToCore( rainbow_task, "rainbow_task", 4096, NULL, 2, &rainbow_sim_task, CORE_1);
-        xSemaphoreGive( sync_rainbow_task );
+        //xSemaphoreGive( sync_rainbow_task );
+        ESP_LOGI(TAG, "rainbow mode: %d", mode);
+        sync_task = sync_rainbow_task;
         led_mode = MODE_RAINBOW;
         break;
     case MODE_SWITCH_COLOR:
+        delete_current_mode_task();
         xTaskCreatePinnedToCore( switching_blue_red, "switching blue red task", 4096, NULL, 2, &color_switch_sim_task, CORE_1);
-        xSemaphoreGive( sync_switch_color_task );
+        //xSemaphoreGive( sync_switch_color_task );
+        sync_task = sync_switch_color_task;
         led_mode = MODE_SWITCH_COLOR;
         break;
     case MODE_COLOR:
+        delete_current_mode_task();
         xTaskCreatePinnedToCore( led_task, "one color task", 4096, NULL, 2, &one_color_sim_task, CORE_1);
-        xSemaphoreGive( sync_color_task );
+        //xSemaphoreGive( sync_color_task );
+        sync_task = sync_color_task;
         led_mode = MODE_COLOR;
         break;
 
     default:
         ESP_LOGI(TAG, "unknown strip mode: %d", mode);
-        led_mode = -1;
+        keep_current_task = true;
         break;
+    }
+    if (!keep_current_task)
+    {
+        // start new task
+        xSemaphoreGive( *sync_task );
     }
     return 0;
 }
@@ -787,7 +849,7 @@ static void mode_control_task(void *arg) {
 	xSemaphoreTake(sync_mode_control_task, portMAX_DELAY);
     ESP_LOGI(TAG, "mode task started");
     switch_led_mode(DEFAULT_LED_MODE);
-	uint8_t mode = 0;
+	int8_t mode = 0;
 	while (true) {
 		xQueueReceive(strip_modes_handle, &mode, portMAX_DELAY);
         switch_led_mode(mode);
